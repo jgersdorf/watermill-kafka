@@ -208,7 +208,7 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 	defer poolHandle.release(producer)
 
 	if err = producer.BeginTxn(); err != nil {
-		return fmt.Errorf("could not begin transaction: %w", err)
+		return fmt.Errorf("could not begin transaction: %w; txnStatus: %v", err, producer.TxnStatus().String())
 	}
 	defer func() {
 		if producer.TxnStatus()&sarama.ProducerTxnFlagAbortableError != 0 {
