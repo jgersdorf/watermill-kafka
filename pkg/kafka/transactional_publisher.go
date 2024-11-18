@@ -392,6 +392,7 @@ func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, e
 	producerConfig := *p.config.OverwriteSaramaConfig
 	producerConfig.Producer.Transaction.ID = fmt.Sprintf("%s-%s-%d", tp.groupID, tp.topic, tp.partition)
 
+	p.logger.Trace("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 	producer, err := sarama.NewSyncProducer(p.config.Brokers, &producerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create producer: %w", err)
