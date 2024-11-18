@@ -141,6 +141,7 @@ func DefaultSaramaSyncTransactionalPublisherConfig() *sarama.Config {
 	config.Net.MaxOpenRequests = 1
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Idempotent = true
+	config.Version = sarama.V2_7_0_0
 
 	return config
 }
@@ -167,7 +168,7 @@ func getConsumerData(msgs ...*message.Message) (consumerData *ConsumerData, err 
 // Publish publishes message to Kafka with transactional support. All messages are sent in a single transaction,
 // and the consumed message is added to the transaction.
 // All messages must have the same consumer data, i.e. the same topic, partition, offset, and group ID.
-func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message) error {
+func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message) (err error) {
 	if p.closed.Load() {
 		return errors.New("publisher closed")
 	}
@@ -182,7 +183,6 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 
 	var consumerData *ConsumerData
 	if p.config.ExactlyOnce {
-		var err error
 		consumerData, err = getConsumerData(msgs...)
 		if err != nil {
 			return fmt.Errorf("could not get consumer data: %w", err)
@@ -212,6 +212,7 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 	}
 	defer func() {
 		if producer.TxnStatus()&sarama.ProducerTxnFlagAbortableError != 0 {
+			logger.Debug("aborting transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			if abortErr := producer.AbortTxn(); abortErr != nil {
 				err = fmt.Errorf("could not abort transaction: %w, originalError: %w", abortErr, err)
 			}
