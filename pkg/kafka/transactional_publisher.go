@@ -216,6 +216,7 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 			if abortErr := producer.AbortTxn(); abortErr != nil {
 				err = fmt.Errorf("could not abort transaction: %w, originalError: %w", abortErr, err)
 			}
+			logger.Debug("aborted transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		}
 	}()
 
