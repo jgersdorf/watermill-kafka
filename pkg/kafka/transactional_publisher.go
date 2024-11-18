@@ -208,9 +208,12 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 	defer poolHandle.release(producer)
 
 	if err = producer.BeginTxn(); err != nil {
-		return fmt.Errorf("could not begin transaction: %w; txnStatus: %v", err, producer.TxnStatus().String())
+		return fmt.Errorf("could not begin transaction: %w; txn_status: %v", err, producer.TxnStatus().String())
 	}
 	defer func() {
+		if err != nil {
+			logger.Error("publishing failed", err, nil)
+		}
 		if producer.TxnStatus()&sarama.ProducerTxnFlagAbortableError != 0 {
 			logger.Debug("aborting transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			if abortErr := producer.AbortTxn(); abortErr != nil {
@@ -374,6 +377,8 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 }
 
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.SyncProducer) {
+	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
+
 	alive, err := closeOnError(producer)
 	if err != nil {
 		p.logger.Error("cannot close producer", err, watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
@@ -382,8 +387,10 @@ func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.Syn
 	p.Lock()
 	defer p.Unlock()
 	if alive {
+		p.logger.Debug("putting producer back to pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
 		p.producers[tp] = producer
 	} else {
+		p.logger.Debug("removing producer from pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
 		delete(p.producers, tp)
 	}
 
@@ -493,6 +500,7 @@ func (p *simpleProducerPool) new() (sarama.SyncProducer, error) {
 }
 
 func (p *simpleProducerPool) release(producer sarama.SyncProducer) {
+	p.logger.Debug("releasing producer", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 	alive, err := closeOnError(producer)
 	if err != nil {
 		p.logger.Error("cannot close producer", err, nil)
