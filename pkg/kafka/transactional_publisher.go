@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"errors"
 
@@ -256,12 +257,14 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 	}
 
 	if p.config.ExactlyOnce {
+		logger.Debug("adding consume message to transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		if err := addMessageToTxn(producer, *consumerData); err != nil {
 			logger.Error("could not add consume message to transaction", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			return fmt.Errorf("could not add consume message to transaction: %w", err)
 		}
 	}
 
+	logger.Debug("committing transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 	if err := producer.CommitTxn(); err != nil {
 		logger.Error("could not commit transaction", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		return fmt.Errorf("could not commit transaction: %w", err)
@@ -394,10 +397,12 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 
 }
 
+// ErrConcurrentTransactions
+
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.SyncProducer) {
 	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
 
-	alive, err := closeOnError(producer)
+	alive, err := closeOnNotReady(producer)
 	if err != nil {
 		p.logger.Error("cannot close producer", err, watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
 	}
@@ -419,7 +424,7 @@ func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, e
 	producerConfig.Producer.Transaction.ID = fmt.Sprintf("%s-%s-%d", tp.groupID, tp.topic, tp.partition)
 
 	p.logger.Debug("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
-	producer, err := sarama.NewSyncProducer(p.config.Brokers, &producerConfig)
+	producer, err := newSyncProducer(p.logger, p.config.Brokers, &producerConfig)
 	if err != nil {
 		p.logger.Error("cannot create producer", err, watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 		return nil, fmt.Errorf("cannot create producer: %w", err)
@@ -507,7 +512,7 @@ func (p *simpleProducerPool) new() (sarama.SyncProducer, error) {
 	producerConfig.Producer.Transaction.ID = fmt.Sprintf("producer-%s", watermill.NewUUID())
 	p.logger.Debug("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 
-	producer, err := sarama.NewSyncProducer(p.config.Brokers, &producerConfig)
+	producer, err := newSyncProducer(p.logger, p.config.Brokers, &producerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create producer: %w", err)
 	}
@@ -521,7 +526,7 @@ func (p *simpleProducerPool) new() (sarama.SyncProducer, error) {
 
 func (p *simpleProducerPool) release(producer sarama.SyncProducer) {
 	p.logger.Debug("releasing producer", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
-	alive, err := closeOnError(producer)
+	alive, err := closeOnNotReady(producer)
 	if err != nil {
 		p.logger.Error("cannot close producer", err, nil)
 	}
@@ -554,12 +559,48 @@ func (p *simpleProducerPool) close() error {
 	return errors.Join(errs...)
 }
 
-func closeOnError(producer sarama.SyncProducer) (alive bool, err error) {
-	if producer.TxnStatus()&sarama.ProducerTxnFlagInError != 0 {
+func closeOnNotReady(producer sarama.SyncProducer) (alive bool, err error) {
+	// after aborting, the producer is somehow moved to the state "ProducerTxnStateInitializing", but will never be ready again
+	// thus we close all producers that are not ready
+	if producer.TxnStatus()&sarama.ProducerTxnFlagReady == 0 {
 		if err := producer.Close(); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
 	return true, nil
+}
+
+func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sarama.Config) (sarama.SyncProducer, error) {
+	attemptsRemaining := config.Producer.Transaction.Retry.Max
+	var lastError error
+	var producer sarama.SyncProducer
+	for attemptsRemaining >= 0 {
+		producer, lastError = sarama.NewSyncProducer(addrs, config)
+		switch {
+		case lastError == nil:
+			return producer, nil
+		case errors.Is(lastError, sarama.ErrConcurrentTransactions):
+			backoff := computeBackoff(config, attemptsRemaining)
+			logger.Debug(
+				fmt.Sprintf("newSyncProducer retrying after %dms... (%d attempts remaining)", backoff/time.Millisecond, attemptsRemaining),
+				watermill.LogFields{"transaction_id": config.Producer.Transaction.ID, "error": lastError.Error},
+			)
+			time.Sleep(backoff)
+			attemptsRemaining--
+			continue
+		default:
+			return nil, fmt.Errorf("cannot create producer: %w", lastError)
+		}
+	}
+	return nil, lastError
+}
+
+func computeBackoff(saramaConfig *sarama.Config, attemptsRemaining int) time.Duration {
+	if saramaConfig.Producer.Transaction.Retry.BackoffFunc != nil {
+		maxRetries := saramaConfig.Producer.Transaction.Retry.Max
+		retries := maxRetries - attemptsRemaining
+		return saramaConfig.Producer.Transaction.Retry.BackoffFunc(retries, maxRetries)
+	}
+	return saramaConfig.Producer.Transaction.Retry.Backoff
 }
