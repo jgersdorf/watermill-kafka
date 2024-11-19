@@ -42,7 +42,7 @@ func NewTransactionalPublisher(
 	logger watermill.LoggerAdapter,
 ) (*TransactionalPublisher, error) {
 	logger = logger.With(watermill.LogFields{"transactional_publisher_id": watermill.NewUUID()})
-	logger.Trace("creating new TransactionalPublisher", nil)
+	logger.Debug("creating new TransactionalPublisher", nil)
 
 	config.setDefaults()
 
@@ -198,54 +198,72 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 
 	poolHandle, err := p.producerPool.getHandle(consumerData)
 	if err != nil {
+		logger.Error("could not get producer pool handle", err, nil)
 		return fmt.Errorf("could not get producer pool handle: %w", err)
 	}
 
 	producer, err := poolHandle.acquire()
 	if err != nil {
+		logger.Error("could not acquire producer", err, nil)
 		return fmt.Errorf("could not acquire producer: %w", err)
 	}
-	defer poolHandle.release(producer)
+	defer func() {
+		logger.Debug("releasing producer", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
+		poolHandle.release(producer)
+	}()
 
+	logger.Debug("beginning transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 	if err = producer.BeginTxn(); err != nil {
+		logger.Error("could not begin transaction", err, nil)
 		return fmt.Errorf("could not begin transaction: %w; txn_status: %v", err, producer.TxnStatus().String())
 	}
 	defer func() {
 		if err != nil {
-			logger.Error("publishing failed", err, nil)
+			logger.Error("publishing failed", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		}
 		if producer.TxnStatus()&sarama.ProducerTxnFlagAbortableError != 0 {
 			logger.Debug("aborting transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			if abortErr := producer.AbortTxn(); abortErr != nil {
+				logger.Error("could not abort transaction", abortErr, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 				err = fmt.Errorf("could not abort transaction: %w, originalError: %w", abortErr, err)
+			} else {
+				logger.Debug("aborted transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			}
-			logger.Debug("aborted transaction", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		}
 	}()
 
 	for _, msg := range msgs {
-		logger.Trace("sending message to Kafka", watermill.LogFields{"message_uuid": msg.UUID})
+		logger.Debug("sending message to Kafka", watermill.LogFields{"message_uuid": msg.UUID})
 
 		kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
 		if err != nil {
+			logger.Error("could not marshal message", err, watermill.LogFields{"message_uuid": msg.UUID})
 			return fmt.Errorf("could not marshal message %s: %w", msg.UUID, err)
 		}
 
 		partition, offset, err := producer.SendMessage(kafkaMsg)
 		if err != nil {
+			logger.Error("could not produce message", err, watermill.LogFields{"txn_status": producer.TxnStatus().String(), "message_uuid": msg.UUID})
 			return fmt.Errorf("could not produce message %s: %w", msg.UUID, err)
 		}
 
-		logger.Trace("message sent to Kafka", watermill.LogFields{"message_uuid": msg.UUID, "kafka_partition": partition, "kafka_partition_offset": offset})
+		logger.Debug("message sent to Kafka", watermill.LogFields{
+			"message_uuid":           msg.UUID,
+			"kafka_partition":        partition,
+			"kafka_partition_offset": offset,
+			"txn_status":             producer.TxnStatus().String(),
+		})
 	}
 
 	if p.config.ExactlyOnce {
 		if err := addMessageToTxn(producer, *consumerData); err != nil {
+			logger.Error("could not add consume message to transaction", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 			return fmt.Errorf("could not add consume message to transaction: %w", err)
 		}
 	}
 
 	if err := producer.CommitTxn(); err != nil {
+		logger.Error("could not commit transaction", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
 
@@ -269,9 +287,9 @@ func (p *TransactionalPublisher) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	p.logger.Trace("closing TransactionalPublisher, waiting for all publish calls to exit", nil)
+	p.logger.Debug("closing TransactionalPublisher, waiting for all publish calls to exit", nil)
 	p.wg.Wait()
-	p.logger.Trace("all publish calls exited, closing producer pool", nil)
+	p.logger.Debug("all publish calls exited, closing producer pool", nil)
 	if err := p.producerPool.close(); err != nil {
 		return fmt.Errorf("could not close producer pool: %w", err)
 	}
@@ -400,11 +418,13 @@ func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, e
 	producerConfig := *p.config.OverwriteSaramaConfig
 	producerConfig.Producer.Transaction.ID = fmt.Sprintf("%s-%s-%d", tp.groupID, tp.topic, tp.partition)
 
-	p.logger.Trace("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
+	p.logger.Debug("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 	producer, err := sarama.NewSyncProducer(p.config.Brokers, &producerConfig)
 	if err != nil {
+		p.logger.Error("cannot create producer", err, watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 		return nil, fmt.Errorf("cannot create producer: %w", err)
 	}
+	p.logger.Debug("created new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 
 	if p.config.Tracer != nil {
 		producer = p.config.Tracer.WrapSyncProducer(&producerConfig, producer)
@@ -485,7 +505,7 @@ func (p *simpleProducerPool) acquire() (sarama.SyncProducer, error) {
 func (p *simpleProducerPool) new() (sarama.SyncProducer, error) {
 	producerConfig := *p.config.OverwriteSaramaConfig
 	producerConfig.Producer.Transaction.ID = fmt.Sprintf("producer-%s", watermill.NewUUID())
-	p.logger.Trace("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
+	p.logger.Debug("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 
 	producer, err := sarama.NewSyncProducer(p.config.Brokers, &producerConfig)
 	if err != nil {
