@@ -584,7 +584,7 @@ func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sar
 			backoff := computeBackoff(config, attemptsRemaining)
 			logger.Debug(
 				fmt.Sprintf("newSyncProducer retrying after %dms... (%d attempts remaining)", backoff/time.Millisecond, attemptsRemaining),
-				watermill.LogFields{"transaction_id": config.Producer.Transaction.ID, "error": lastError.Error},
+				watermill.LogFields{"transaction_id": config.Producer.Transaction.ID, "error": lastError.Error()},
 			)
 			time.Sleep(backoff)
 			attemptsRemaining--
