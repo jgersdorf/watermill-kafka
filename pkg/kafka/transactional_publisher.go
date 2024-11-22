@@ -269,6 +269,7 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 		logger.Error("could not commit transaction", err, watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 		return fmt.Errorf("could not commit transaction: %w", err)
 	}
+	logger.Debug("transaction committed", watermill.LogFields{"txn_status": producer.TxnStatus().String()})
 
 	return nil
 }
@@ -396,8 +397,6 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 	}
 
 }
-
-// ErrConcurrentTransactions
 
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.SyncProducer) {
 	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
