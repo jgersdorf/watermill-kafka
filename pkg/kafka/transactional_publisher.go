@@ -142,7 +142,7 @@ func DefaultSaramaSyncTransactionalPublisherConfig() *sarama.Config {
 	config.Net.MaxOpenRequests = 1
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Idempotent = true
-	config.Version = sarama.V2_7_0_0
+	config.Version = sarama.DefaultVersion
 
 	return config
 }
