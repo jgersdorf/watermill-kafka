@@ -100,8 +100,7 @@ type TransactionalPublisherConfig struct {
 	// Messages must be consumed by a Subscriber with ExactlyOnce = true.
 	ExactlyOnce bool
 
-	// ProducerPoolSize is only relevant when ExactlyOnce is false. It limits the number of producers that can be created.
-	// For ExactlyOnce = true, the pool size is dependend on the number of partitions of the consumed topic.
+	// ProducerPoolSize limits the number of producers that can be created.
 	// Defaults to 10
 	ProducerPoolSize int
 }
@@ -111,7 +110,7 @@ func (c *TransactionalPublisherConfig) setDefaults() {
 		c.OverwriteSaramaConfig = DefaultSaramaSyncTransactionalPublisherConfig()
 	}
 
-	if !c.ExactlyOnce && c.ProducerPoolSize == 0 {
+	if c.ProducerPoolSize == 0 {
 		c.ProducerPoolSize = 10
 	}
 }
@@ -124,14 +123,6 @@ func (c TransactionalPublisherConfig) Validate() error {
 	}
 	if c.Marshaler == nil {
 		errs = append(errs, errors.New("missing marshaler"))
-	}
-
-	if c.ExactlyOnce && c.ProducerPoolSize != 0 {
-		errs = append(errs, errors.New("producer pool size is not relevant when ExactlyOnce is true"))
-	}
-
-	if !c.ExactlyOnce && c.ProducerPoolSize == 0 {
-		errs = append(errs, errors.New("producer pool size is required when ExactlyOnce is false"))
 	}
 
 	if err := c.OverwriteSaramaConfig.Validate(); err != nil {
