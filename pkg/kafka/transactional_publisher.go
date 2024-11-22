@@ -324,6 +324,7 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 		MaxCost:     maxCost,
 		BufferItems: 64,
 		OnEvict: func(item *ristretto.Item[sarama.SyncProducer]) {
+			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
 			if item.Value != nil {
 				if err := item.Value.Close(); err != nil {
 					logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
