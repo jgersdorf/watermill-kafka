@@ -315,6 +315,9 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 		MaxCost:     maxCost,
 		BufferItems: 64,
 		OnEvict: func(item *ristretto.Item[sarama.SyncProducer]) {
+			if item == nil {
+				return
+			}
 			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
 			if item.Value != nil {
 				if err := item.Value.Close(); err != nil {
@@ -323,6 +326,9 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 			}
 		},
 		OnExit: func(val sarama.SyncProducer) {
+			if val == nil {
+				return
+			}
 			if err := val.Close(); err != nil {
 				logger.Error("cannot close producer", err, nil)
 			}
@@ -401,23 +407,15 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 		return nil, errors.New("pool closed")
 	}
 
-	var producer sarama.SyncProducer
-	var ok bool
-
-	if producer, ok = p.cache.Get(tp.String()); ok {
-		if producer == nil {
-			return nil, fmt.Errorf("producer for topic %s and partition %d is already acquired", tp.topic, tp.partition)
-		}
-		p.cache.Set(tp.String(), nil, 1)
-	} else {
-		var err error
-		producer, err = p.new(tp)
-		if err != nil {
-			return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
-		}
-		p.cache.Set(tp.String(), nil, 1)
+	producer, ok := p.cache.Get(tp.String())
+	if ok {
+		return producer, nil
 	}
-	p.logger.Debug("acquired producer", watermill.LogFields{"transaction_id": tp.String()})
+	producer, err := p.new(tp)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
+	}
+	p.cache.Set(tp.String(), producer, 1)
 	return producer, nil
 
 }
@@ -427,10 +425,7 @@ func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.Syn
 
 	alive := producer.TxnStatus()&sarama.ProducerTxnFlagReady == 1
 
-	if alive {
-		p.logger.Debug("putting producer back to pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
-		p.cache.Set(tp.String(), producer, 1)
-	} else {
+	if !alive {
 		p.logger.Debug("removing producer from pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
 		p.cache.Del(tp.String())
 	}
