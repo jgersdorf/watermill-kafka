@@ -7,6 +7,7 @@ toolchain go1.23.0
 require (
 	github.com/IBM/sarama v1.43.3
 	github.com/ThreeDotsLabs/watermill v1.3.7
+	github.com/dgraph-io/ristretto/v2 v2.0.0
 	github.com/dnwe/otelsarama v0.0.0-20240308230250-9388d9d40bc0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/pkg/errors v0.9.1
@@ -14,7 +15,9 @@ require (
 )
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20230731223053-c322873962e3 // indirect
 	github.com/eapache/queue v1.1.0 // indirect
@@ -40,5 +43,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
 	golang.org/x/crypto v0.26.0 // indirect
 	golang.org/x/net v0.28.0 // indirect
+	golang.org/x/sys v0.26.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

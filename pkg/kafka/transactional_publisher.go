@@ -11,6 +11,7 @@ import (
 	"github.com/IBM/sarama"
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/dgraph-io/ristretto/v2"
 )
 
 // TransactionalPublisher is a Kafka Publisher with transactional support.
@@ -61,7 +62,11 @@ func NewTransactionalPublisher(
 
 	var pool producerPool
 	if config.ExactlyOnce {
-		pool = newExactlyOnceProducerPool(config, logger)
+		if p, err := newExactlyOnceProducerPool(config, logger); err != nil {
+			return nil, err
+		} else {
+			pool = p
+		}
 	} else {
 		pool = newSimpleProducerPool(config, logger)
 	}
@@ -311,24 +316,46 @@ type producerHandle interface {
 	release(producer sarama.SyncProducer)
 }
 
-func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger watermill.LoggerAdapter) *exactlyOnceProducerPool {
-	return &exactlyOnceProducerPool{
-		logger:    logger,
-		config:    config,
-		producers: map[topicPartition]sarama.SyncProducer{},
+func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger watermill.LoggerAdapter) (*exactlyOnceProducerPool, error) {
+	maxCost := int64(config.ProducerPoolSize)
+	numCounters := maxCost * 10
+	cache, err := ristretto.NewCache(&ristretto.Config[string, sarama.SyncProducer]{
+		NumCounters: numCounters,
+		MaxCost:     maxCost,
+		BufferItems: 64,
+		OnEvict: func(item *ristretto.Item[sarama.SyncProducer]) {
+			if item.Value != nil {
+				if err := item.Value.Close(); err != nil {
+					logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
+				}
+			}
+		},
+		OnExit: func(val sarama.SyncProducer) {
+			if err := val.Close(); err != nil {
+				logger.Error("cannot close producer", err, nil)
+			}
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot create producer pool: %w", err)
 	}
+
+	return &exactlyOnceProducerPool{
+		logger: logger,
+		config: config,
+		cache:  cache,
+	}, nil
 }
 
 // exactlyOnceProducerPool pools transactional sarama.SyncProducer instances based on the topic and partition of an incoming message,
 // supporting an atomic "read-process-write" pattern.
 type exactlyOnceProducerPool struct {
-	sync.Mutex
 	config TransactionalPublisherConfig
 	logger watermill.LoggerAdapter
 
 	// producers is a map of groupID-topic-partition to producer.
 	// If the value exists and is nil, it means that the producer is acquired.
-	producers map[topicPartition]sarama.SyncProducer
+	cache *ristretto.Cache[string, sarama.SyncProducer]
 
 	closed atomic.Bool
 }
@@ -364,6 +391,10 @@ type topicPartition struct {
 	partition int32
 }
 
+func (tp topicPartition) String() string {
+	return fmt.Sprintf("%s-%s-%d", tp.groupID, tp.topic, tp.partition)
+}
+
 // acquire returns a producer for the given topic and partition.
 // It makes sure, that only one producer is created for each topic-partition pair.
 // It is assumed that the caller makes sure that there is only one concurrent call to acquire for the same topic-partition pair.
@@ -378,49 +409,45 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 		return nil, errors.New("pool closed")
 	}
 
-	p.Lock()
-	defer p.Unlock()
+	var producer sarama.SyncProducer
+	var ok bool
 
-	if producer, ok := p.producers[tp]; ok {
+	if producer, ok = p.cache.Get(tp.String()); ok {
 		if producer == nil {
 			return nil, fmt.Errorf("producer for topic %s and partition %d is already acquired", tp.topic, tp.partition)
 		}
-		p.producers[tp] = nil
-		return producer, nil
+		p.cache.Set(tp.String(), nil, 1)
 	} else {
-		producer, err := p.new(tp)
+		var err error
+		producer, err = p.new(tp)
 		if err != nil {
 			return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
 		}
-		p.producers[tp] = nil
-		return producer, nil
+		p.cache.Set(tp.String(), nil, 1)
 	}
+	p.logger.Debug("acquired producer", watermill.LogFields{"transaction_id": tp.String()})
+	return producer, nil
 
 }
 
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.SyncProducer) {
 	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
 
-	alive, err := closeOnNotReady(producer)
-	if err != nil {
-		p.logger.Error("cannot close producer", err, watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
-	}
+	alive := producer.TxnStatus()&sarama.ProducerTxnFlagReady == 1
 
-	p.Lock()
-	defer p.Unlock()
 	if alive {
 		p.logger.Debug("putting producer back to pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
-		p.producers[tp] = producer
+		p.cache.Set(tp.String(), producer, 1)
 	} else {
 		p.logger.Debug("removing producer from pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
-		delete(p.producers, tp)
+		p.cache.Del(tp.String())
 	}
 
 }
 
 func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, error) {
 	producerConfig := *p.config.OverwriteSaramaConfig
-	producerConfig.Producer.Transaction.ID = fmt.Sprintf("%s-%s-%d", tp.groupID, tp.topic, tp.partition)
+	producerConfig.Producer.Transaction.ID = tp.String()
 
 	p.logger.Debug("creating new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 	producer, err := newSyncProducer(p.logger, p.config.Brokers, &producerConfig)
@@ -443,21 +470,9 @@ func (p *exactlyOnceProducerPool) close() error {
 		return nil
 	}
 
-	p.Lock()
-	defer p.Unlock()
+	p.cache.Clear()
 
-	var errs []error
-	for tp, producer := range p.producers {
-		if producer == nil {
-			errs = append(errs, fmt.Errorf("error while closing producerPool: producer for group %s topic %s and partition %d is still acquired", tp.groupID, tp.topic, tp.partition))
-		} else {
-			if err := producer.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("error while closing producerPool: cannot close producer for groupID %s, topic %s and partition %d: %w", tp.groupID, tp.topic, tp.partition, err))
-			}
-		}
-		delete(p.producers, tp)
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 type token struct{}
