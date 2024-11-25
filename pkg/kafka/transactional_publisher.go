@@ -416,6 +416,7 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 			p.logger.Debug("acquired existing producer", watermill.LogFields{"transaction_id": tp.String()})
 			return producer, nil
 		}
+		p.logger.Debug("producer is closed, removing from cache", watermill.LogFields{"transaction_id": tp.String()})
 		producer.Unlock()
 	}
 	producer, err := p.new(tp)
@@ -445,7 +446,7 @@ func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProdu
 		p.logger.Debug("releasing producer", watermill.LogFields{"transaction_id": tp.String()})
 		p.cache.Set(tp.String(), producer, 1)
 	} else {
-		p.logger.Debug("removing producer from pool", watermill.LogFields{"transactionl_id": tp.String()})
+		p.logger.Debug("removing producer from pool", watermill.LogFields{"transaction_id": tp.String()})
 		p.cache.Del(tp.String())
 	}
 
@@ -595,9 +596,11 @@ type syncProducer struct {
 	sarama.SyncProducer
 	sync.Mutex
 	closed bool
+	logger watermill.LoggerAdapter
 }
 
 func (s *syncProducer) Close() error {
+	s.logger.Debug("closing syncProducer", nil)
 	if s.TryLock() {
 		defer s.Unlock()
 		return fmt.Errorf("called Close() on an unlocked producer")
@@ -614,7 +617,7 @@ func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sar
 		producer, lastError = sarama.NewSyncProducer(addrs, config)
 		switch {
 		case lastError == nil:
-			return &syncProducer{SyncProducer: producer}, nil
+			return &syncProducer{SyncProducer: producer, logger: logger}, nil
 		case errors.Is(lastError, sarama.ErrConcurrentTransactions):
 			backoff := computeBackoff(config, attemptsRemaining)
 			logger.Debug(
