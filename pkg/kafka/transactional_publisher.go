@@ -319,9 +319,9 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
+			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
 			item.Value.Lock()
 			defer item.Value.Unlock()
-			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
 			if item.Value != nil {
 				if err := item.Value.Close(); err != nil {
 					logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
@@ -332,6 +332,8 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 	if err != nil {
 		return nil, fmt.Errorf("cannot create producer pool: %w", err)
 	}
+
+	logger.Debug("created new exactlyOnceProducerPool", watermill.LogFields{"max_cost": maxCost, "num_counters": numCounters})
 
 	return &exactlyOnceProducerPool{
 		logger: logger,
@@ -411,6 +413,7 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 	if ok {
 		producer.Lock()
 		if !producer.closed {
+			p.logger.Debug("acquired existing producer", watermill.LogFields{"transaction_id": tp.String()})
 			return producer, nil
 		}
 		producer.Unlock()
@@ -421,6 +424,7 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 	}
 	producer.Lock()
 	p.cache.Set(tp.String(), producer, 1)
+	p.logger.Debug("acquired new producer", watermill.LogFields{"transaction_id": tp.String()})
 	return producer, nil
 
 }
