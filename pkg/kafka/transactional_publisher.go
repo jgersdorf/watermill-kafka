@@ -310,27 +310,22 @@ type producerHandle interface {
 func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger watermill.LoggerAdapter) (*exactlyOnceProducerPool, error) {
 	maxCost := int64(config.ProducerPoolSize)
 	numCounters := maxCost * 10
-	cache, err := ristretto.NewCache(&ristretto.Config[string, sarama.SyncProducer]{
+	cache, err := ristretto.NewCache(&ristretto.Config[string, *syncProducer]{
 		NumCounters: numCounters,
 		MaxCost:     maxCost,
 		BufferItems: 64,
-		OnEvict: func(item *ristretto.Item[sarama.SyncProducer]) {
-			if item == nil {
+		OnEvict: func(item *ristretto.Item[*syncProducer]) {
+			if item == nil || item.Value == nil {
+				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
+			item.Value.Lock()
+			defer item.Value.Unlock()
 			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
 			if item.Value != nil {
 				if err := item.Value.Close(); err != nil {
 					logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
 				}
-			}
-		},
-		OnExit: func(val sarama.SyncProducer) {
-			if val == nil {
-				return
-			}
-			if err := val.Close(); err != nil {
-				logger.Error("cannot close producer", err, nil)
 			}
 		},
 	})
@@ -353,7 +348,7 @@ type exactlyOnceProducerPool struct {
 
 	// producers is a map of groupID-topic-partition to producer.
 	// If the value exists and is nil, it means that the producer is acquired.
-	cache *ristretto.Cache[string, sarama.SyncProducer]
+	cache *ristretto.Cache[string, *syncProducer]
 
 	closed atomic.Bool
 }
@@ -378,7 +373,12 @@ func (h *exactlyOnceProducerPoolHandle) acquire() (sarama.SyncProducer, error) {
 }
 
 func (h *exactlyOnceProducerPoolHandle) release(producer sarama.SyncProducer) {
-	h.pool.release(h.tp, producer)
+	syncProducer, ok := producer.(*syncProducer)
+	if !ok {
+		h.pool.logger.Error("cannot release producer", errors.New("producer is not a *syncProducer"), nil)
+		panic("producer is not a *syncProducer")
+	}
+	h.pool.release(h.tp, syncProducer)
 
 }
 
@@ -401,7 +401,7 @@ func (tp topicPartition) String() string {
 // more information.
 //
 // [transactions-apache-kafka]: https://www.confluent.io/blog/transactions-apache-kafka/
-func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProducer, error) {
+func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, error) {
 
 	if p.closed.Load() {
 		return nil, errors.New("pool closed")
@@ -409,30 +409,41 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (sarama.SyncProduce
 
 	producer, ok := p.cache.Get(tp.String())
 	if ok {
-		return producer, nil
+		producer.Lock()
+		if !producer.closed {
+			return producer, nil
+		}
+		producer.Unlock()
 	}
 	producer, err := p.new(tp)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
 	}
+	producer.Lock()
 	p.cache.Set(tp.String(), producer, 1)
 	return producer, nil
 
 }
 
-func (p *exactlyOnceProducerPool) release(tp topicPartition, producer sarama.SyncProducer) {
+func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProducer) {
 	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
+	defer producer.Unlock()
 
-	alive := producer.TxnStatus()&sarama.ProducerTxnFlagReady == 1
-
-	if !alive {
-		p.logger.Debug("removing producer from pool", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition})
+	alive, err := closeOnNotReady(producer)
+	if err != nil {
+		p.logger.Error("cannot close producer", err, nil)
+	}
+	if alive {
+		p.logger.Debug("releasing producer", watermill.LogFields{"transaction_id": tp.String()})
+		p.cache.Set(tp.String(), producer, 1)
+	} else {
+		p.logger.Debug("removing producer from pool", watermill.LogFields{"transactionl_id": tp.String()})
 		p.cache.Del(tp.String())
 	}
 
 }
 
-func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, error) {
+func (p *exactlyOnceProducerPool) new(tp topicPartition) (*syncProducer, error) {
 	producerConfig := *p.config.OverwriteSaramaConfig
 	producerConfig.Producer.Transaction.ID = tp.String()
 
@@ -445,7 +456,7 @@ func (p *exactlyOnceProducerPool) new(tp topicPartition) (sarama.SyncProducer, e
 	p.logger.Debug("created new producer", watermill.LogFields{"transaction_id": producerConfig.Producer.Transaction.ID})
 
 	if p.config.Tracer != nil {
-		producer = p.config.Tracer.WrapSyncProducer(&producerConfig, producer)
+		producer.SyncProducer = p.config.Tracer.WrapSyncProducer(&producerConfig, producer.SyncProducer)
 	}
 
 	return producer, nil
@@ -519,7 +530,7 @@ func (p *simpleProducerPool) new() (sarama.SyncProducer, error) {
 	}
 
 	if p.config.Tracer != nil {
-		producer = p.config.Tracer.WrapSyncProducer(&producerConfig, producer)
+		producer.SyncProducer = p.config.Tracer.WrapSyncProducer(&producerConfig, producer.SyncProducer)
 	}
 
 	return producer, nil
@@ -572,7 +583,22 @@ func closeOnNotReady(producer sarama.SyncProducer) (alive bool, err error) {
 	return true, nil
 }
 
-func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sarama.Config) (sarama.SyncProducer, error) {
+type syncProducer struct {
+	sarama.SyncProducer
+	sync.Mutex
+	closed bool
+}
+
+func (s *syncProducer) Close() error {
+	if s.TryLock() {
+		defer s.Unlock()
+		return fmt.Errorf("called Close() on an unlocked producer")
+	}
+	s.closed = true
+	return s.SyncProducer.Close()
+}
+
+func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sarama.Config) (*syncProducer, error) {
 	attemptsRemaining := config.Producer.Transaction.Retry.Max
 	var lastError error
 	var producer sarama.SyncProducer
@@ -580,7 +606,7 @@ func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sar
 		producer, lastError = sarama.NewSyncProducer(addrs, config)
 		switch {
 		case lastError == nil:
-			return producer, nil
+			return &syncProducer{SyncProducer: producer}, nil
 		case errors.Is(lastError, sarama.ErrConcurrentTransactions):
 			backoff := computeBackoff(config, attemptsRemaining)
 			logger.Debug(
