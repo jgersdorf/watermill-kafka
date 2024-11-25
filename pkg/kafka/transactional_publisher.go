@@ -423,7 +423,11 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 		return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
 	}
 	producer.Lock()
-	p.cache.Set(tp.String(), producer, 1)
+	set := p.cache.Set(tp.String(), producer, 1)
+	if !set {
+		p.logger.Debug("cannot set producer in cache", watermill.LogFields{"transaction_id": tp.String()})
+	}
+	p.cache.Wait()
 	p.logger.Debug("acquired new producer", watermill.LogFields{"transaction_id": tp.String()})
 	return producer, nil
 
