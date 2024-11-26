@@ -629,11 +629,11 @@ type syncProducer struct {
 }
 
 func (s *syncProducer) Close() error {
+	s.Lock()
+	defer s.Unlock()
 	if s.closed {
 		return nil
 	}
-	s.Lock()
-	defer s.Unlock()
 	s.closed = true
 	return s.SyncProducer.Close()
 }
