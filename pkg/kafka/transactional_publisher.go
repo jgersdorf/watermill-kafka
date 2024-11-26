@@ -193,6 +193,7 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 		}
 		logger = logger.With(
 			watermill.LogFields{
+				"transaction_id":    topicPartition{groupID: consumerData.GroupID, topic: consumerData.Topic, partition: consumerData.Partition}.String(),
 				"consume_partition": consumerData.Partition,
 				"consume_offset":    consumerData.Offset,
 				"consume_group_id":  consumerData.GroupID,
@@ -645,6 +646,7 @@ func (s *syncProducer) CloseAsync() {
 		if err := s.Close(); err != nil {
 			s.logger.Error("cannot close producer", err, nil)
 		}
+		s.logger.Debug("producer closed", nil)
 	}()
 }
 
