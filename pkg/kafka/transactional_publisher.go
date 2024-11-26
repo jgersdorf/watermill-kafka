@@ -311,10 +311,11 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 	maxCost := int64(config.ProducerPoolSize)
 	numCounters := maxCost * 10
 	cache, err := ristretto.NewCache(&ristretto.Config[string, *syncProducer]{
-		NumCounters: numCounters,
-		MaxCost:     maxCost,
-		BufferItems: 64,
-		Metrics:     true,
+		NumCounters:        numCounters,
+		MaxCost:            maxCost,
+		IgnoreInternalCost: true,
+		BufferItems:        64,
+		Metrics:            true,
 		OnEvict: func(item *ristretto.Item[*syncProducer]) {
 			if item == nil || item.Value == nil {
 				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
