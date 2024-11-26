@@ -314,19 +314,23 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 		NumCounters: numCounters,
 		MaxCost:     maxCost,
 		BufferItems: 64,
+		Metrics:     true,
 		OnEvict: func(item *ristretto.Item[*syncProducer]) {
 			if item == nil || item.Value == nil {
 				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
-			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
-			item.Value.Lock()
-			defer item.Value.Unlock()
-			if item.Value != nil {
-				if err := item.Value.Close(); err != nil {
-					logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
+			go func() {
+				logger.Debug("try to get lock to evict producer", watermill.LogFields{"transaction_id": item.Key})
+				item.Value.Lock()
+				logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
+				defer item.Value.Unlock()
+				if item.Value != nil {
+					if err := item.Value.Close(); err != nil {
+						logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
+					}
 				}
-			}
+			}()
 		},
 	})
 	if err != nil {
@@ -429,13 +433,15 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 		p.logger.Debug("cannot set producer in cache", watermill.LogFields{"transaction_id": tp.String()})
 	}
 	p.cache.Wait()
-	p.logger.Debug("acquired new producer", watermill.LogFields{"transaction_id": tp.String()})
+	p.logger.Debug("acquired new producer", watermill.LogFields{
+		"transaction_id": tp.String(),
+		"metrics":        p.cache.Metrics.String(),
+	})
 	return producer, nil
 
 }
 
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProducer) {
-	p.logger.Debug("releasing producer", watermill.LogFields{"groupID": tp.groupID, "topic": tp.topic, "partition": tp.partition, "txn_status": producer.TxnStatus().String()})
 	defer producer.Unlock()
 
 	alive, err := closeOnNotReady(producer)
@@ -443,10 +449,15 @@ func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProdu
 		p.logger.Error("cannot close producer", err, nil)
 	}
 	if alive {
-		p.logger.Debug("releasing producer", watermill.LogFields{"transaction_id": tp.String()})
-		p.cache.Set(tp.String(), producer, 1)
+		p.logger.Debug("releasing producer", watermill.LogFields{
+			"transaction_id": tp.String(),
+			"metrics":        p.cache.Metrics.String(),
+		})
 	} else {
-		p.logger.Debug("removing producer from pool", watermill.LogFields{"transaction_id": tp.String()})
+		p.logger.Debug("removing producer from pool", watermill.LogFields{
+			"transaction_id": tp.String(),
+			"metrics":        p.cache.Metrics.String(),
+		})
 		p.cache.Del(tp.String())
 	}
 
