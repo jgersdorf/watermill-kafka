@@ -337,7 +337,7 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 				item.Value.logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
-			item.Value.logger.Debug("evicting producer", nil)
+			item.Value.logger.Debug("evicting producer", watermill.LogFields{"expiration": item.Expiration})
 			item.Value.CloseAsync()
 		},
 	})
