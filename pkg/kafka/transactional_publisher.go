@@ -453,7 +453,7 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProducer) {
 	defer producer.Unlock()
 
-	if producer.TxnStatus()&sarama.ProducerTxnFlagReady == 1 {
+	if producer.TxnStatus()&sarama.ProducerTxnFlagReady != 0 {
 		p.logger.Debug("releasing producer", watermill.LogFields{
 			"transaction_id": tp.String(),
 			"metrics":        p.cache.Metrics.String(),
