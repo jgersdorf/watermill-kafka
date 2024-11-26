@@ -325,18 +325,18 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 		Metrics:            true,
 		OnReject: func(item *ristretto.Item[*syncProducer]) {
 			if item == nil || item.Value == nil {
-				logger.Error("rejected syncProducer not existing", errors.New("item or item value is nil"), nil)
+				item.Value.logger.Error("rejected syncProducer not existing", errors.New("item or item value is nil"), nil)
 				return
 			}
-			logger.Debug("closing rejected producer", watermill.LogFields{"transaction_id": item.Key})
+			item.Value.logger.Debug("closing rejected producer", nil)
 			item.Value.CloseAsync()
 		},
 		OnEvict: func(item *ristretto.Item[*syncProducer]) {
 			if item == nil || item.Value == nil {
-				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
+				item.Value.logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
-			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
+			item.Value.logger.Debug("evicting producer", nil)
 			item.Value.CloseAsync()
 		},
 	})
@@ -656,7 +656,10 @@ func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sar
 		producer, lastError = sarama.NewSyncProducer(addrs, config)
 		switch {
 		case lastError == nil:
-			return &syncProducer{SyncProducer: producer, logger: logger}, nil
+			return &syncProducer{
+				SyncProducer: producer,
+				logger:       logger.With(watermill.LogFields{"transaction_id": config.Producer.Transaction.ID}),
+			}, nil
 		case errors.Is(lastError, sarama.ErrConcurrentTransactions):
 			backoff := computeBackoff(config, attemptsRemaining)
 			logger.Debug(
