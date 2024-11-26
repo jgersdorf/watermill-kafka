@@ -103,6 +103,9 @@ type TransactionalPublisherConfig struct {
 	// ProducerPoolSize limits the number of producers that can be created.
 	// Defaults to 10
 	ProducerPoolSize int
+
+	// ProducerTTL is the time after which the producer will be closed if it is not used.
+	ProducerTTL time.Duration
 }
 
 func (c *TransactionalPublisherConfig) setDefaults() {
@@ -112,6 +115,10 @@ func (c *TransactionalPublisherConfig) setDefaults() {
 
 	if c.ProducerPoolSize == 0 {
 		c.ProducerPoolSize = 10
+	}
+
+	if c.ProducerTTL == 0 {
+		c.ProducerTTL = 1 * time.Minute
 	}
 }
 
@@ -316,22 +323,21 @@ func newExactlyOnceProducerPool(config TransactionalPublisherConfig, logger wate
 		IgnoreInternalCost: true,
 		BufferItems:        64,
 		Metrics:            true,
+		OnReject: func(item *ristretto.Item[*syncProducer]) {
+			if item == nil || item.Value == nil {
+				logger.Error("rejected syncProducer not existing", errors.New("item or item value is nil"), nil)
+				return
+			}
+			logger.Debug("closing rejected producer", watermill.LogFields{"transaction_id": item.Key})
+			item.Value.CloseAsync()
+		},
 		OnEvict: func(item *ristretto.Item[*syncProducer]) {
 			if item == nil || item.Value == nil {
 				logger.Error("cannot evict producer", errors.New("item or item value is nil"), nil)
 				return
 			}
-			go func() {
-				logger.Debug("try to get lock to evict producer", watermill.LogFields{"transaction_id": item.Key})
-				item.Value.Lock()
-				logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
-				defer item.Value.Unlock()
-				if item.Value != nil {
-					if err := item.Value.Close(); err != nil {
-						logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": item.Key})
-					}
-				}
-			}()
+			logger.Debug("evicting producer", watermill.LogFields{"transaction_id": item.Key})
+			item.Value.CloseAsync()
 		},
 	})
 	if err != nil {
@@ -429,9 +435,11 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 		return nil, fmt.Errorf("cannot create producer for topic %s and partition %d: %w", tp.topic, tp.partition, err)
 	}
 	producer.Lock()
-	set := p.cache.Set(tp.String(), producer, 1)
-	if !set {
+	if !p.cache.SetWithTTL(tp.String(), producer, 1, p.config.ProducerTTL) {
 		p.logger.Debug("cannot set producer in cache", watermill.LogFields{"transaction_id": tp.String()})
+		// although the producer is not in the cache, we can use it
+		// the release call will take care of adding it to the cache or close it if this is still not possible
+		return producer, nil
 	}
 	p.cache.Wait()
 	p.logger.Debug("acquired new producer", watermill.LogFields{
@@ -445,22 +453,30 @@ func (p *exactlyOnceProducerPool) acquire(tp topicPartition) (*syncProducer, err
 func (p *exactlyOnceProducerPool) release(tp topicPartition, producer *syncProducer) {
 	defer producer.Unlock()
 
-	alive, err := closeOnNotReady(producer)
-	if err != nil {
-		p.logger.Error("cannot close producer", err, nil)
-	}
-	if alive {
+	if producer.TxnStatus()&sarama.ProducerTxnFlagReady == 1 {
 		p.logger.Debug("releasing producer", watermill.LogFields{
 			"transaction_id": tp.String(),
 			"metrics":        p.cache.Metrics.String(),
 		})
-	} else {
-		p.logger.Debug("removing producer from pool", watermill.LogFields{
-			"transaction_id": tp.String(),
-			"metrics":        p.cache.Metrics.String(),
-		})
-		p.cache.Del(tp.String())
+		if p.cache.SetWithTTL(tp.String(), producer, 1, p.config.ProducerTTL) {
+			return
+		}
 	}
+
+	// if we get here, either the producer is not ready, or we couldn't set it in the cache
+	// we close the producer and delete it from the cache
+	// we can't just ignore it and hope that the TTL eviction will take care of it, because maybe the producer could
+	// also not be inserted in the acquire() call into the cache
+
+	if err := producer.Close(); err != nil {
+		p.logger.Error("cannot close producer", err, watermill.LogFields{"transaction_id": tp.String()})
+	}
+
+	p.logger.Debug("removing producer from pool", watermill.LogFields{
+		"transaction_id": tp.String(),
+		"metrics":        p.cache.Metrics.String(),
+	})
+	p.cache.Del(tp.String())
 
 }
 
@@ -612,13 +628,24 @@ type syncProducer struct {
 }
 
 func (s *syncProducer) Close() error {
-	s.logger.Debug("closing syncProducer", nil)
-	if s.TryLock() {
-		defer s.Unlock()
-		return fmt.Errorf("called Close() on an unlocked producer")
+	if s.closed {
+		return nil
 	}
+	s.Lock()
+	defer s.Unlock()
 	s.closed = true
 	return s.SyncProducer.Close()
+}
+
+func (s *syncProducer) CloseAsync() {
+	if s.closed {
+		return
+	}
+	go func() {
+		if err := s.Close(); err != nil {
+			s.logger.Error("cannot close producer", err, nil)
+		}
+	}()
 }
 
 func newSyncProducer(logger watermill.LoggerAdapter, addrs []string, config *sarama.Config) (*syncProducer, error) {
