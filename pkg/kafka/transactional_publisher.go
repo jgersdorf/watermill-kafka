@@ -43,17 +43,17 @@ func NewTransactionalPublisher(
 	config TransactionalPublisherConfig,
 	logger watermill.LoggerAdapter,
 ) (*TransactionalPublisher, error) {
-	logger = logger.With(watermill.LogFields{"transactional_publisher_id": watermill.NewUUID()})
-	logger.Debug("creating new TransactionalPublisher", nil)
+	if logger == nil {
+		logger = watermill.NopLogger{}
+	} else {
+		logger = logger.With(watermill.LogFields{"transactional_publisher_id": watermill.NewUUID()})
+		logger.Debug("creating new TransactionalPublisher", nil)
+	}
 
 	config.setDefaults()
 
 	if err := config.Validate(); err != nil {
 		return nil, err
-	}
-
-	if logger == nil {
-		logger = watermill.NopLogger{}
 	}
 
 	if config.OTELEnabled && config.Tracer == nil {
@@ -193,11 +193,8 @@ func (p *TransactionalPublisher) Publish(topic string, msgs ...*message.Message)
 		}
 		logger = logger.With(
 			watermill.LogFields{
-				"transaction_id":    topicPartition{groupID: consumerData.GroupID, topic: consumerData.Topic, partition: consumerData.Partition}.String(),
-				"consume_partition": consumerData.Partition,
-				"consume_offset":    consumerData.Offset,
-				"consume_group_id":  consumerData.GroupID,
-				"consume_topic":     consumerData.Topic},
+				"transaction_id": topicPartition{groupID: consumerData.GroupID, topic: consumerData.Topic, partition: consumerData.Partition}.String(),
+			},
 		)
 	}
 
